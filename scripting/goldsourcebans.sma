@@ -87,10 +87,13 @@ public VoiceSetClientListening(receiver, sender, bool:bListen)
 	if (!is_user_connected(receiver) || !is_user_connected(sender))
     	return FMRES_IGNORED;
 	
-	new iSpeakValue = gag_voice[sender] ? 1 : 0;
-	engfunc(EngFunc_SetClientListening, receiver, sender, iSpeakValue);
+	if (gag_voice[sender])
+	{
+		engfunc(EngFunc_SetClientListening, receiver, sender, 0);
+		return FMRES_SUPERCEDE;
+	}
 
-	return FMRES_SUPERCEDE;
+	return FMRES_IGNORED;
 }
 
 //------------------
