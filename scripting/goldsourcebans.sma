@@ -5,32 +5,43 @@
 
 #include <amxmodx>
 #include <amxmisc>
-#include <engine>
 #include <geoip>
 #include <fakemeta>
 #include <sqlx>
 #include <fun>
 
 // Plugin
-#define PLUGIN						"GoldSourcebans"
-#define AUTHOR						"JonnyBoy0719"
-#define VERSION						"1.0"
-#define MaxClients					32
+#define PLUGIN					"GoldSrcBans"
+#define AUTHOR					"JonnyBoy0719, Aoi.Kagase"
+#define VERSION					"2.0"
+#define MaxClients				32
+
+#define MAX_ERR_LENGTH			512
+#define MAX_QUERY_LENGTH		2048
+#define MAX_LENGTH				128
+
+enum DB_CONFIG
+{
+	DB_HOST,
+	DB_USER,
+	DB_PASS,
+	DB_TYPE,
+	DB_NAME,
+	DB_PREFIX,
+}
 
 // MySQL
-new mysqlx_host,
-	mysqlx_user,
-	mysqlx_db,
-	mysqlx_pass,
-	mysqlx_type,
-	Handle:sql_db,
-	Handle:sql_api,
-	sql_cache[2024],
-	sql_error[128],
-	sql_errno;
+//Database Handles
+new Handle:g_dbTaple;
+new Handle:g_dbConnect;
+new g_dbConfig	[DB_CONFIG][MAX_LENGTH];
+new g_dbError	[MAX_ERR_LENGTH];
+new sql_cache	[MAX_QUERY_LENGTH + 1];
+new const SQL_INSERT_GAG[] = 
+	"INSERT INTO %s_comms (authid, name, created, ends, length, reason, aid, adminIp, sid, type) \
+	 VALUES ('%s', '%s', UNIX_TIMESTAMP(), UNIX_TIMESTAMP() + %d, %d, '%s', IFNULL((SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^^STEAM_[0-9]:%s$'), '0'), '%s', %d, %d)";
 
-new DatabasePrefix[10] = "sb",
-	WebsiteAddress[128],
+new WebsiteAddress[128],
 	serverID = -1,
 	bool:HasLoadedBans = false,
 	bool:HasLoadedGags = false;
@@ -48,26 +59,27 @@ new bool:gag_chat[33],
 
 public plugin_init()
 {
-	register_plugin	(PLUGIN, VERSION, AUTHOR);
-	register_cvar	("amx_goldsourcebans_version", VERSION, FCVAR_SPONLY|FCVAR_SERVER);
-	set_cvar_string	("amx_goldsourcebans_version", VERSION);
+	register_plugin	 (PLUGIN, VERSION, AUTHOR);
+	register_cvar	 ("amx_goldsrcbans_version", VERSION, FCVAR_SPONLY|FCVAR_SERVER);
+	set_cvar_string	 ("amx_goldsrcbans_version", VERSION);
 
 	// SQL Cvar Setup
-	mysqlx_host = register_cvar ("sourcebans_host", "127.0.0.1"); // The host from the db
-	mysqlx_user = register_cvar ("sourcebans_user", "sourcebans"); // The username from the db login
-	mysqlx_pass = register_cvar ("sourcebans_pass", "sourcebans"); // The password from the db password
-	mysqlx_type = register_cvar ("sourcebans_type", "mysql"); // The password from the db type
-	mysqlx_db 	= register_cvar ("sourcebans_dbname", "sourcebans"); // The database name
+	bind_pcvar_string(create_cvar ("sourcebans_host", 	"127.0.0.1"), 	g_dbConfig[DB_HOST], 	charsmax(g_dbConfig[])); // The host from the db
+	bind_pcvar_string(create_cvar ("sourcebans_user", 	"sourcebans"), 	g_dbConfig[DB_USER], 	charsmax(g_dbConfig[])); // The username from the db login
+	bind_pcvar_string(create_cvar ("sourcebans_pass", 	"sourcebans"),	g_dbConfig[DB_PASS], 	charsmax(g_dbConfig[])); // The password from the db password
+	bind_pcvar_string(create_cvar ("sourcebans_type", 	"mysql"),		g_dbConfig[DB_TYPE], 	charsmax(g_dbConfig[])); // The password from the db type
+	bind_pcvar_string(create_cvar ("sourcebans_dbname", "sourcebans"),	g_dbConfig[DB_NAME], 	charsmax(g_dbConfig[])); // The database name
+	bind_pcvar_string(create_cvar ("sourcebans_prefix", "sb"),			g_dbConfig[DB_PREFIX], 	charsmax(g_dbConfig[])); // The database prefix
 
 	// Ban System
-	register_concmd	("amx_ban", 	"CVAR_BanPlayer", 			ADMIN_BAN, "<#userid|name> <time> <timetype> [reason]");
-	register_concmd	("amx_banip", 	"CVAR_BanPlayerIP", 		ADMIN_BAN, "<ip> <time> <timetype> [reason]");
-	register_concmd	("amx_addban",	"CVAR_BanPlayerSteamID", 	ADMIN_BAN, "<time> <timetype> <steamid> [reason]");
-	register_concmd	("amx_unban", 	"CVAR_UnBanPlayer", 		ADMIN_BAN, "<steamid|ip> [reason]");
+	register_concmd	 ("amx_ban", 	"CmdBanPlayer", 		ADMIN_BAN, "<#userid|name> <time> <timetype> [reason]");
+	register_concmd	 ("amx_banip", 	"CmdBanPlayerIP", 		ADMIN_BAN, "<ip> <time> <timetype> [reason]");
+	register_concmd	 ("amx_addban",	"CmdBanPlayerSteamID", 	ADMIN_BAN, "<time> <timetype> <steamid> [reason]");
+	register_concmd	 ("amx_unban", 	"CmdUnBanPlayer", 		ADMIN_BAN, "<steamid|ip> [reason]");
 
 	// Voice com and chat bans
-	register_concmd	("amx_gag", 	"CVAR_GagPlayer", 			ADMIN_BAN, "<#userid|name> <time> <timetype> <type> [reason]");
-	register_concmd	("amx_ungag", 	"CVAR_UnGagPlayer", 		ADMIN_BAN, "<#userid|name> <type> [reason]");
+	register_concmd	 ("amx_gag", 	"CmdGagPlayer", 		ADMIN_BAN, "<#userid|name> <time> <timetype> <type> [reason]");
+	register_concmd	 ("amx_ungag", 	"CmdUnGagPlayer", 		ADMIN_BAN, "<#userid|name> <type> [reason]");
 
 	// Client commands
 	register_clcmd("say","say_hook");
@@ -97,65 +109,141 @@ public VoiceSetClientListening(receiver, sender, bool:bListen)
 }
 
 //------------------
-//	CVAR_UnGagPlayer()
+//	CmdGagPlayer()
 //------------------
-
-public CVAR_UnGagPlayer(id, level, cid)
+public CmdGagPlayer(id, level, cid)
 {
 	if (!cmd_access(id, level, cid, 2))
 		return PLUGIN_HANDLED;
 
-	new arg[32],	// <userid>
-		arg2[32],	// <type>
-		arg3[125];	// [reason]
+	new szUserId	[32];	// <#userid|name|steamid>
+	new	szTime		[32];	// <time>
+	new	szTimeType	[32];	// <timetype>
+	new	szGagType	[32];	// <0|1|2>
+	new	szReason	[125];	// [reason]
 
-	read_argv(1, arg, 31);
-	read_argv(2, arg2, 124);
-	read_argv(3, arg3, 124);
+	read_argv(1, szUserId, 	charsmax(szUserId));
+	read_argv(2, szTime, 	charsmax(szTime));
+	read_argv(3, szTimeType,charsmax(szTimeType));
+	read_argv(4, szGagType, charsmax(szGagType));
+	read_argv(5, szReason, 	charsmax(szReason));
 
-	new bool:SteamID = false;
+	new iTimeType = str_to_num(szTimeType);
+	new	iTime 	  = str_to_num(szTime);
+	new	szTimeTypeMsg[32] = "";
 
-	new player = cmd_target(id, arg, CMDTARGET_OBEY_IMMUNITY | CMDTARGET_ALLOW_SELF);
-
-	new iPlayers[32],
-		PlayerSteamID[32],
-		iNum;
-
-	get_players(iPlayers, iNum);
-	for(new i = 0;i < iNum; i++)
+	if ( iTimeType == -1 || iTimeType > 3 )
 	{
-		new players = iPlayers[i];
-		if(is_user_connected(players))
-		{
-			get_user_authid(players, PlayerSteamID, 31);
-			if (equali(PlayerSteamID, arg))
-			{
-				player = players;
-				SteamID = true;
-				break;
-			}
-		}
-	}
-
-	if (!player && !SteamID)
-	{
-		client_print(id, print_console, "Player ^"%s^" was not found!", arg);
+		// TODO: Multi Language.
+		client_print(id, print_console, "Available time types are:");
+		client_print(id, print_console, "0 - minutes");
+		client_print(id, print_console, "1 - hours");
+		client_print(id, print_console, "2 - days");
+		client_print(id, print_console, "3 - weeks");
 		return PLUGIN_HANDLED;
 	}
 
-	if (equali(arg3, ""))
-		arg3 = "No Reason given.";
+	switch( iTimeType )
+	{
+		// TODO: Multi Language.
+		case 0:formatex(szTimeTypeMsg, charsmax(szTimeTypeMsg), "minute(s)");
+		case 1:formatex(szTimeTypeMsg, charsmax(szTimeTypeMsg), "hour(s)");
+		case 2:formatex(szTimeTypeMsg, charsmax(szTimeTypeMsg), "day(s)");
+		case 3:formatex(szTimeTypeMsg, charsmax(szTimeTypeMsg), "week(s)");
+	}
 
-	UnGagPlayer(id, player, str_to_num(arg2), arg3, false);
+	if (!access(id, ADMIN_LEVEL_A))
+	{
+		client_print(id, print_console, "You do not have access to gag permanently.");
+		return PLUGIN_HANDLED;
+	}
+
+	new player = cmd_target(id, szUserId, CMDTARGET_OBEY_IMMUNITY | CMDTARGET_ALLOW_SELF);
+	if (!player)
+	{
+		client_print(id, print_console, "Player ^"%s^" was not found!", szUserId);
+		return PLUGIN_HANDLED;
+	}
+
+	// Check if he has access for permanent time
+	if (iTime == 0)
+	{
+		client_print(id, print_console, "You do not have access to gag permanently.");
+		return PLUGIN_HANDLED;
+	}
+
+	// Lets setup the time
+	switch( iTimeType )
+	{
+		case 1:
+			iTime = (iTime * 60); // Hours
+		case 2:
+			iTime = (iTime * 60 * 24); // Days
+		case 3:
+			iTime = (iTime * 60 * 24 * 7); // Weeks
+	}
+
+	// Then check, if we can ban more than 1 week.
+	if (iTime > 10080)
+	{
+		client_print(id, print_console, "You do not have access to gag more than 1 week.");
+		return PLUGIN_HANDLED;
+	}
+
+	new iGagType = str_to_num(szGagType);
+
+	if (iGagType < 0 || iGagType > 2)
+	{
+		client_print(id, print_console, "allowed types are:");
+		client_print(id, print_console, "0 - silence");
+		client_print(id, print_console, "1 - mute");
+		client_print(id, print_console, "2 - gag");
+		return PLUGIN_HANDLED;
+	}
+
+	GagPlayer(id, player, str_to_num(szTime), iTime, iGagType, szReason, szTimeTypeMsg, false);
+
+	return PLUGIN_HANDLED;
+}
+//------------------
+//	CmdUnGagPlayer()
+//------------------
+
+public CmdUnGagPlayer(id, level, cid)
+{
+	if (!cmd_access(id, level, cid, 2))
+		return PLUGIN_HANDLED;
+
+	new szUserId	[32];	// <userid>
+	new	szType		[32];	// <type>
+	new	szReason	[125];	// [reason]
+
+	read_argv(1, szUserId, 	charsmax(szUserId));
+	read_argv(2, szType, 	charsmax(szType));
+	read_argv(3, szReason, 	charsmax(szReason));
+
+	// STEAM_ID or #id.
+	new player = cmd_target(id, szUserId, CMDTARGET_OBEY_IMMUNITY | CMDTARGET_ALLOW_SELF);
+
+	if (!player)
+	{
+		client_print(id, print_console, "Player ^"%s^" was not found!", szUserId);
+		return PLUGIN_HANDLED;
+	}
+
+	if (equali(szReason, ""))
+		formatex(szReason, charsmax(szReason), "No Reason given.");
+
+	UnGagPlayer(id, player, str_to_num(szType), szReason, false);
 
 	return PLUGIN_HANDLED;
 }
 
 //------------------
-//	CVAR_UnBanPlayer()
+//	CmdUnBanPlayer()
 //------------------
 
-public CVAR_UnBanPlayer(id, level, cid)
+public CmdUnBanPlayer(id, level, cid)
 {
 	if (!cmd_access(id, level, cid, 2))
 		return PLUGIN_HANDLED;
@@ -170,17 +258,17 @@ public CVAR_UnBanPlayer(id, level, cid)
 		arg2 = "No Reason given.";
 
 	if (containi(arg, "STEAM_") != -1)
-		format(sql_cache, sizeof(sql_cache), "SELECT bid FROM %s_bans WHERE (type = 0 AND authid = '%s') AND (length = '0' OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL", DatabasePrefix, arg);
+		formatex(sql_cache, charsmax(sql_cache), "SELECT bid FROM %s_bans WHERE (type = 0 AND authid = '%s') AND (length = '0' OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL", g_dbConfig[DB_PREFIX], arg);
 	else
-		format(sql_cache, sizeof(sql_cache), "SELECT bid FROM %s_bans WHERE (type = 1 AND ip = '%s') AND (length = '0' OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL", DatabasePrefix, arg);
+		formatex(sql_cache, charsmax(sql_cache), "SELECT bid FROM %s_bans WHERE (type = 1 AND ip = '%s') AND (length = '0' OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL", g_dbConfig[DB_PREFIX], arg);
 
-	new Handle:query = SQL_PrepareQuery(sql_api, sql_cache);
+	new Handle:query = SQL_PrepareQuery(g_dbConnect, sql_cache);
 
 	if (!SQL_Execute(query))
 	{
 		server_print("query not saved");
-		SQL_QueryError(query, sql_error, 127);
-		server_print("[AMXX] %L", LANG_SERVER, "SQL_CANT_LOAD_ADMINS", sql_error);
+		SQL_QueryError(query, g_dbError, charsmax(g_dbError));
+		server_print("[AMXX] %L", LANG_SERVER, "SQL_CANT_LOAD_ADMINS", g_dbError);
 	}
 	else if (SQL_NumResults(query) >= 1)
 	{
@@ -210,10 +298,10 @@ public CVAR_UnBanPlayer(id, level, cid)
 			SQL_NextRow(query);
 		}
 
-		format(sql_cache, sizeof(sql_cache), "UPDATE %s_bans SET RemovedBy = (SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^^STEAM_[0-9]:%s$'), RemoveType = 'U', RemovedOn = UNIX_TIMESTAMP(), ureason = '%s' WHERE bid = %d", 
-			DatabasePrefix, DatabasePrefix, adminAuth, adminAuth[8], arg2, sql_bid);
+		format(sql_cache, charsmax(sql_cache), "UPDATE %s_bans SET RemovedBy = (SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^^STEAM_[0-9]:%s$'), RemoveType = 'U', RemovedOn = UNIX_TIMESTAMP(), ureason = '%s' WHERE bid = %d", 
+			g_dbConfig[DB_PREFIX], g_dbConfig[DB_PREFIX], adminAuth, adminAuth[8], arg2, sql_bid);
 
-		SQL_ThreadQuery(sql_db, "QueryHandle", sql_cache);
+		SQL_ThreadQuery(g_dbTaple, "QueryHandle", sql_cache);
 	}
 	else
 	{
@@ -229,7 +317,7 @@ public CVAR_UnBanPlayer(id, level, cid)
 	get_user_authid(id, authid, 31);
 	get_user_name(id, name, 31);
 
-	log_amx("GoldSourceBans CMD: ^"%s<%d><%s><>^" has unbanned ^"%s^" - reason: ^"%s^"", name, get_user_userid(id), authid, arg, arg2);
+	log_amx("GoldSrcBans CMD: ^"%s<%d><%s><>^" has unbanned ^"%s^" - reason: ^"%s^"", name, get_user_userid(id), authid, arg, arg2);
 
 	new formated_text[501];
 	format(formated_text, 500, "[SourceBans] ^"%s<%s>^" has unbanned ^"%s^" - reason: ^"%s^"", name, authid, arg, arg2);
@@ -241,10 +329,10 @@ public CVAR_UnBanPlayer(id, level, cid)
 }
 
 //------------------
-//	CVAR_BanPlayer()
+//	CmdBanPlayer()
 //------------------
 
-public CVAR_BanPlayer(id, level, cid)
+public CmdBanPlayer(id, level, cid)
 {
 	if (!cmd_access(id, level, cid, 2))
 		return PLUGIN_HANDLED;
@@ -378,9 +466,9 @@ public CVAR_BanPlayer(id, level, cid)
 		timetypeSTR = "permanently";
 
 	if ( IsConsole )
-		log_amx("GoldSourceBans CMD: ^"%s<%d><%s><>^" has been banned for %d %s - reason: ^"%s^"", name2, get_user_userid(player), authid2, str_to_num(arg2), timetypeSTR, arg4);
+		log_amx("GoldSrcBans CMD: ^"%s<%d><%s><>^" has been banned for %d %s - reason: ^"%s^"", name2, get_user_userid(player), authid2, str_to_num(arg2), timetypeSTR, arg4);
 	else
-		log_amx("GoldSourceBans CMD: ^"%s<%d><%s><>^" has banned ^"%s<%d><%s><>^" for %d %s - reason: ^"%s^"", name, get_user_userid(id), authid, name2, get_user_userid(player), authid2, str_to_num(arg2), timetypeSTR, arg4);
+		log_amx("GoldSrcBans CMD: ^"%s<%d><%s><>^" has banned ^"%s<%d><%s><>^" for %d %s - reason: ^"%s^"", name, get_user_userid(id), authid, name2, get_user_userid(player), authid2, str_to_num(arg2), timetypeSTR, arg4);
 
 	new formated_text[501];
 
@@ -403,146 +491,13 @@ public CVAR_BanPlayer(id, level, cid)
 	return PLUGIN_HANDLED;
 }
 
-//------------------
-//	CVAR_GagPlayer()
-//------------------
 
-public CVAR_GagPlayer(id, level, cid)
-{
-	if (!cmd_access(id, level, cid, 2))
-		return PLUGIN_HANDLED;
-
-	new arg[32],	// <#userid|name|steamid>
-		arg2[32],	// <time>
-		arg2b[32],	// <timetype>
-		arg3[32],	// <0|1|2>
-		arg4[125];	// [reason]
-
-	new bool:SteamID = false;
-
-	read_argv(1, arg, 31);
-	read_argv(2, arg2, 31);
-	read_argv(3, arg2b, 31);
-	read_argv(4, arg3, 31);
-	read_argv(5, arg4, 124);
-
-	new timetype = str_to_num(arg2b),
-		time = str_to_num(arg2),
-		timetypeSTR[32] = "";
-
-	if ( timetype == -1 || timetype > 3 )
-	{
-		client_print(id, print_console, "Available time types are:");
-		client_print(id, print_console, "0 - minutes");
-		client_print(id, print_console, "1 - hours");
-		client_print(id, print_console, "2 - days");
-		client_print(id, print_console, "3 - weeks");
-		return PLUGIN_HANDLED;
-	}
-
-	switch( timetype )
-	{
-		case 0:
-			timetypeSTR = "minute(s)";
-		case 1:
-			timetypeSTR = "hour(s)";
-		case 2:
-			timetypeSTR = "day(s)";
-		case 3:
-			timetypeSTR = "week(s)";
-	}
-
-	// Check if he has access for permanent time
-	if (str_to_num(arg2) == 0 && !access(id, ADMIN_LEVEL_A))
-	{
-		client_print(id, print_console, "You do not have access to gag permanently.");
-		return PLUGIN_HANDLED;
-	}
-	// Then check, if we can ban more than 1 week.
-	else if (str_to_num(arg2) > 10080 && !access(id, ADMIN_LEVEL_A) && timetype == 0 )
-	{
-		client_print(id, print_console, "You do not have access to gag more than 1 week.");
-		return PLUGIN_HANDLED;
-	}
-	// Check the hours
-	else if (str_to_num(arg2) > 168 && !access(id, ADMIN_LEVEL_A) && timetype == 1 )
-	{
-		client_print(id, print_console, "You do not have access to gag more than 1 week.");
-		return PLUGIN_HANDLED;
-	}
-	// Check the days
-	else if (str_to_num(arg2) > 7 && !access(id, ADMIN_LEVEL_A) && timetype == 2 )
-	{
-		client_print(id, print_console, "You do not have access to gag more than 1 week.");
-		return PLUGIN_HANDLED;
-	}
-	// Check the weeks
-	else if (str_to_num(arg2) > 1 && !access(id, ADMIN_LEVEL_A) && timetype == 3 )
-	{
-		client_print(id, print_console, "You do not have access to gag more than 1 week.");
-		return PLUGIN_HANDLED;
-	}
-
-	new type = str_to_num(arg3);
-
-	if (type < 0 || type > 2)
-	{
-		client_print(id, print_console, "allowed types are:");
-		client_print(id, print_console, "0 - silence");
-		client_print(id, print_console, "1 - mute");
-		client_print(id, print_console, "2 - gag");
-		return PLUGIN_HANDLED;
-	}
-
-	new player = cmd_target(id, arg, CMDTARGET_OBEY_IMMUNITY | CMDTARGET_ALLOW_SELF);
-
-	new iPlayers[32],
-		PlayerSteamID[32],
-		iNum;
-
-	get_players(iPlayers, iNum);
-	for(new i = 0;i < iNum; i++)
-	{
-		new players = iPlayers[i];
-		if(is_user_connected(players))
-		{
-			get_user_authid(players, PlayerSteamID, 31);
-			if (equali(PlayerSteamID, arg))
-			{
-				player = players;
-				SteamID = true;
-				break;
-			}
-		}
-	}
-
-	if (!player && !SteamID)
-	{
-		client_print(id, print_console, "Player ^"%s^" was not found!", arg);
-		return PLUGIN_HANDLED;
-	}
-
-	// Lets setup the time
-	switch( timetype )
-	{
-		case 1:
-			time = (time * 60); // Hours
-		case 2:
-			time = (time * 60 * 24); // Days
-		case 3:
-			time = (time * 60 * 24 * 7); // Weeks
-	}
-
-	GagPlayer(id, player, str_to_num(arg2), time, type, arg4, timetypeSTR, false);
-
-	return PLUGIN_HANDLED;
-}
 
 //------------------
-//	CVAR_BanPlayerIP()
+//	CmdBanPlayerIP()
 //------------------
 
-public CVAR_BanPlayerIP(id, level, cid)
+public CmdBanPlayerIP(id, level, cid)
 {
 	if (!cmd_access(id, level, cid, 2))
 		return PLUGIN_HANDLED;
@@ -587,13 +542,13 @@ public CVAR_BanPlayerIP(id, level, cid)
 
 	new time = str_to_num(arg2);
 
-	new Handle:query = SQL_PrepareQuery(sql_api, "SELECT bid FROM %s_bans WHERE type = 1 AND ip = '%s' AND (length = 0 OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL", DatabasePrefix, arg);
+	new Handle:query = SQL_PrepareQuery(g_dbConnect, "SELECT bid FROM %s_bans WHERE type = 1 AND ip = '%s' AND (length = 0 OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL", g_dbConfig[DB_PREFIX], arg);
 
 	if (!SQL_Execute(query))
 	{
 		server_print("query not saved");
-		SQL_QueryError(query, sql_error, 127);
-		server_print("[AMXX] %L", LANG_SERVER, "SQL_CANT_LOAD_ADMINS", sql_error);
+		SQL_QueryError(query, g_dbError, charsmax(g_dbError));
+		server_print("[AMXX] %L", LANG_SERVER, "SQL_CANT_LOAD_ADMINS", g_dbError);
 	} else {
 		if (id && is_user_connected(id))
 			client_print(id, print_chat, "%s is already banned!", arg);
@@ -631,20 +586,20 @@ public CVAR_BanPlayerIP(id, level, cid)
 		formatex(sql_cache, sizeof(sql_cache), "INSERT INTO %s_bans (type, ip, name, created, ends, length, reason, aid, adminIp, sid, country) VALUES \
 						(1, '%s', '', UNIX_TIMESTAMP(), UNIX_TIMESTAMP() + %d, %d, '%s', (SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^^STEAM_[0-9]:%s$'), '%s', \
 						(SELECT sid FROM %s_servers WHERE ip = '%s' AND port = '%s' LIMIT 0,1), ' ')", 
-			DatabasePrefix, arg, (time * 60), (time * 60), arg4, DatabasePrefix, adminAuth, adminAuth[8], adminIp, DatabasePrefix, ServerIP, ServerPort);
+			g_dbConfig[DB_PREFIX], arg, (time * 60), (time * 60), arg4, g_dbConfig[DB_PREFIX], adminAuth, adminAuth[8], adminIp, g_dbConfig[DB_PREFIX], ServerIP, ServerPort);
 	} else {
 		formatex(sql_cache, sizeof(sql_cache), "INSERT INTO %s_bans (type, ip, name, created, ends, length, reason, aid, adminIp, sid, country) VALUES \
 						(1, '%s', '', UNIX_TIMESTAMP(), UNIX_TIMESTAMP() + %d, %d, '%s', (SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^^STEAM_[0-9]:%s$'), '%s', \
 						%d, ' ')", 
-			DatabasePrefix, arg, (time * 60), (time * 60), arg4, DatabasePrefix, adminAuth, adminAuth[8], adminIp, serverID);
+			g_dbConfig[DB_PREFIX], arg, (time * 60), (time * 60), arg4, g_dbConfig[DB_PREFIX], adminAuth, adminAuth[8], adminIp, serverID);
 	}
 
 	if( time == 0 )
 		timetypeSTR = "permanently";
 
-	SQL_ThreadQuery(sql_db, "QueryHandle", sql_cache);
+	SQL_ThreadQuery(g_dbTaple, "QueryHandle", sql_cache);
 
-	log_amx("GoldSourceBans CMD: ^"%s<%d><%s><>^" banned the ip ^"%s^" for %d %s - reason: %s", Name, get_user_userid(id), adminAuth, arg, time, timetypeSTR, arg4);
+	log_amx("GoldSrcBans CMD: ^"%s<%d><%s><>^" banned the ip ^"%s^" for %d %s - reason: %s", Name, get_user_userid(id), adminAuth, arg, time, timetypeSTR, arg4);
 
 	new formated_text[501];
 	format(formated_text, 500, "[SourceBans] ^"%s<%s>^" banned the ip ^"%s^" for %d %s - reason: %s", Name, adminAuth, arg, time, timetypeSTR, arg4);
@@ -658,10 +613,10 @@ public CVAR_BanPlayerIP(id, level, cid)
 }
 
 //------------------
-//	CVAR_BanPlayerSteamID()
+//	CmdBanPlayerSteamID()
 //------------------
 
-public CVAR_BanPlayerSteamID(id, level, cid)
+public CmdBanPlayerSteamID(id, level, cid)
 {
 	if (!cmd_access(id, level, cid, 2))
 		return PLUGIN_HANDLED;
@@ -704,13 +659,13 @@ public CVAR_BanPlayerSteamID(id, level, cid)
 	if (equali(arg3, ""))
 		arg3 = "No Reason given.";
 
-	new Handle:query = SQL_PrepareQuery(sql_api, "SELECT bid FROM %s_bans WHERE type = 0 AND authid = '%s' AND (length = 0 OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL", DatabasePrefix, arg2);
+	new Handle:query = SQL_PrepareQuery(g_dbConnect, "SELECT bid FROM %s_bans WHERE type = 0 AND authid = '%s' AND (length = 0 OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL", g_dbConfig[DB_PREFIX], arg2);
 
 	if (!SQL_Execute(query))
 	{
 		server_print("query not saved");
-		SQL_QueryError(query, sql_error, 127);
-		server_print("[AMXX] %L", LANG_SERVER, "SQL_CANT_LOAD_ADMINS", sql_error);
+		SQL_QueryError(query, g_dbError, charsmax(g_dbError));
+		server_print("[AMXX] %L", LANG_SERVER, "SQL_CANT_LOAD_ADMINS", g_dbError);
 	} else {
 		if (id && is_user_connected(id))
 			client_print(id, print_chat, "%s is already banned!", arg2);
@@ -750,20 +705,20 @@ public CVAR_BanPlayerSteamID(id, level, cid)
 		formatex(sql_cache, sizeof(sql_cache), "INSERT INTO %s_bans (authid, name, created, ends, length, reason, aid, adminIp, sid, country) VALUES \
 						('%s', '', UNIX_TIMESTAMP(), UNIX_TIMESTAMP() + %d, %d, '%s', (SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^^STEAM_[0-9]:%s$'), '%s', \
 						(SELECT sid FROM %s_servers WHERE ip = '%s' AND port = '%s' LIMIT 0,1), ' ')", 
-			DatabasePrefix, arg2, (time * 60), (time * 60), arg3, DatabasePrefix, adminAuth, adminAuth[8], adminIp, DatabasePrefix, ServerIP, ServerPort);
+			g_dbConfig[DB_PREFIX], arg2, (time * 60), (time * 60), arg3, g_dbConfig[DB_PREFIX], adminAuth, adminAuth[8], adminIp, g_dbConfig[DB_PREFIX], ServerIP, ServerPort);
 	} else {
 		formatex(sql_cache, sizeof(sql_cache), "INSERT INTO %s_bans (authid, name, created, ends, length, reason, aid, adminIp, sid, country) VALUES \
 						('%s', '', UNIX_TIMESTAMP(), UNIX_TIMESTAMP() + %d, %d, '%s', (SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^^STEAM_[0-9]:%s$'), '%s', \
 						%d, ' ')", 
-			DatabasePrefix, arg2, (time * 60), (time * 60), arg3, DatabasePrefix, adminAuth, adminAuth[8], adminIp, serverID);
+			g_dbConfig[DB_PREFIX], arg2, (time * 60), (time * 60), arg3, g_dbConfig[DB_PREFIX], adminAuth, adminAuth[8], adminIp, serverID);
 	}
 
-	SQL_ThreadQuery(sql_db, "QueryHandle", sql_cache);
+	SQL_ThreadQuery(g_dbTaple, "QueryHandle", sql_cache);
 
 	if( time == 0 )
 		timetypeSTR = "permanently";
 
-	log_amx("GoldSourceBans CMD: ^"%s<%d><%s><>^" banned the SteamID ^"%s^" for %d %s - reason: %s", Name, get_user_userid(id), adminAuth, arg2, time, timetypeSTR, arg3);
+	log_amx("GoldSrcBans CMD: ^"%s<%d><%s><>^" banned the SteamID ^"%s^" for %d %s - reason: %s", Name, get_user_userid(id), adminAuth, arg2, time, timetypeSTR, arg3);
 
 	new formated_text[501];
 	format(formated_text, 500, "[SourceBans] ^"%s<%s>^" banned the SteamID ^"%s^" for %d %s - reason: %s", Name, adminAuth, arg2, time, timetypeSTR, arg3);
@@ -797,10 +752,10 @@ public plugin_cfg()
 public plugin_end()
 {
 	// Lets close down the connection
-	if (sql_db)
-		SQL_FreeHandle(sql_db);
-	if (sql_api)
-		SQL_FreeHandle(sql_api);
+	if (g_dbTaple)
+		SQL_FreeHandle(g_dbTaple);
+	if (g_dbConnect)
+		SQL_FreeHandle(g_dbConnect);
 }
 
 //------------------
@@ -900,11 +855,11 @@ stock CheckIfBanned(id)
 	get_user_authid(id, auth, 63);
 	get_user_ip(id, ip, 63);
 
-	formatex( sql_cache, sizeof(sql_cache), "SELECT bid FROM %s_bans WHERE ((type = 0 AND authid REGEXP '^^STEAM_[0-9]:%s$') OR (type = 1 AND ip = '%s')) AND (length = '0' OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL", DatabasePrefix, auth[8], ip);
+	formatex( sql_cache, sizeof(sql_cache), "SELECT bid FROM %s_bans WHERE ((type = 0 AND authid REGEXP '^^STEAM_[0-9]:%s$') OR (type = 1 AND ip = '%s')) AND (length = '0' OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL", g_dbConfig[DB_PREFIX], auth[8], ip);
 	new send_id[1];
 	send_id[0] = id;
 
-	SQL_ThreadQuery(sql_db, "CheckBannedPlayer", sql_cache, send_id, 1);
+	SQL_ThreadQuery(g_dbTaple, "CheckBannedPlayer", sql_cache, send_id, 1);
 }
 
 //------------------
@@ -922,11 +877,11 @@ stock CheckIfGagged(id)
 	get_user_authid(id, auth, 63);
 	get_user_ip(id, ip, 63);
 
-	formatex( sql_cache, sizeof(sql_cache), "SELECT bid,type FROM %s_comms WHERE authid REGEXP '^^STEAM_[0-9]:%s$' AND (length = '0' OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL", DatabasePrefix, auth[8], ip);
+	formatex( sql_cache, sizeof(sql_cache), "SELECT bid,type FROM %s_comms WHERE authid REGEXP '^^STEAM_[0-9]:%s$' AND (length = '0' OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL", g_dbConfig[DB_PREFIX], auth[8], ip);
 	new send_id[1];
 	send_id[0] = id;
 
-	SQL_ThreadQuery(sql_db, "CheckGaggedPlayers", sql_cache, send_id, 1);
+	SQL_ThreadQuery(g_dbTaple, "CheckGaggedPlayers", sql_cache, send_id, 1);
 }
 
 //------------------
@@ -982,9 +937,9 @@ stock BanPlayer(admin, victim, time, banReason[])
 	formatex( sql_cache, sizeof(sql_cache), "INSERT INTO %s_bans (ip, authid, name, created, ends, length, reason, aid, adminIp, sid, country) VALUES \
 					('%s', '%s', '%s', UNIX_TIMESTAMP(), UNIX_TIMESTAMP() + %d, %d, '%s', IFNULL((SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^^STEAM_[0-9]:%s$'),'0'), '%s', \
 					(SELECT sid FROM %s_servers WHERE ip = '%s' AND port = '%s' LIMIT 0,1), ' ')", 
-		DatabasePrefix, Ip, Authid, Name, (time * 60), (time * 60), banReason, DatabasePrefix, AdminAuthid, AdminAuthid[8], AdminIp, DatabasePrefix, ServerIP, ServerPort);
+		g_dbConfig[DB_PREFIX], Ip, Authid, Name, (time * 60), (time * 60), banReason, g_dbConfig[DB_PREFIX], AdminAuthid, AdminAuthid[8], AdminIp, g_dbConfig[DB_PREFIX], ServerIP, ServerPort);
 
-	SQL_ThreadQuery(sql_db, "QueryHandle", sql_cache);
+	SQL_ThreadQuery(g_dbTaple, "QueryHandle", sql_cache);
 
 	server_cmd("kick #%d ^"%s^"", get_user_userid(victim), banReason);
 }
@@ -1046,14 +1001,21 @@ stock GagPlayer(admin, victim, timereal, time, type, banReason[], GagStringSetup
 	if (type_sql == 0)
 		type_sql = 1;
 
-	formatex( sql_cache, sizeof(sql_cache), 
-		"INSERT INTO %s_comms (authid, name, created, ends, length, reason, aid, adminIp, sid, type) \
-			VALUES ('%s', '%s', UNIX_TIMESTAMP(), UNIX_TIMESTAMP() + %d, %d, '%s', \
-				IFNULL((SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^^STEAM_[0-9]:%s$'), '0'), \
-					'%s', %d, %d)", 
-		DatabasePrefix, Authid, Name, (time * 60), (time * 60), banReason, DatabasePrefix, AdminAuthid, AdminAuthid[8], AdminIp, serverID, type_sql);
+	formatex(sql_cache, sizeof(sql_cache), SQL_INSERT_GAG, 
+			g_dbConfig[DB_PREFIX], 
+			Authid, 
+			Name, 
+			(time * 60), 
+			(time * 60), 
+			banReason, 
+			g_dbConfig[DB_PREFIX], 
+			AdminAuthid, 
+			AdminAuthid[8], 
+			AdminIp, 
+			serverID, 
+			type_sql);
 
-	SQL_ThreadQuery(sql_db, "QueryHandle", sql_cache);
+	SQL_ThreadQuery(g_dbTaple, "QueryHandle", sql_cache);
 
 	if (!IsSilence)
 	{
@@ -1074,7 +1036,7 @@ stock GagPlayer(admin, victim, timereal, time, type, banReason[], GagStringSetup
 			gag_chat[victim] = true;
 		}
 
-		log_amx("GoldSourceBans CMD: ^"%s<%d><%s><>^" has %s ^"%s<%d><%s><>^" %s - reason: ^"%s^"", AdminName, get_user_userid(admin), AdminAuthid, TypeName, Name, get_user_userid(victim), Authid, TimeString, banReason);
+		log_amx("GoldSrcBans CMD: ^"%s<%d><%s><>^" has %s ^"%s<%d><%s><>^" %s - reason: ^"%s^"", AdminName, get_user_userid(admin), AdminAuthid, TypeName, Name, get_user_userid(victim), Authid, TimeString, banReason);
 
 		if (time == 0)
 			format(TimeString, sizeof(TimeString), "permanently");
@@ -1116,15 +1078,15 @@ stock UnGagPlayer(admin, victim, type, banMessage[], bool:IsSilence)
 	if (type_sql == 0)
 		type_sql = 1;
 
-	format(sql_cache, sizeof(sql_cache), "SELECT bid FROM %s_comms WHERE (type = %d AND authid = '%s') AND (length = '0' OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL", DatabasePrefix, type_sql, authid);
+	formatex(sql_cache, charsmax(sql_cache), "SELECT bid FROM %s_comms WHERE (type = %d AND authid = '%s') AND (length = '0' OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL", g_dbConfig[DB_PREFIX], type_sql, authid);
 
-	new Handle:query = SQL_PrepareQuery(sql_api, sql_cache);
+	new Handle:query = SQL_PrepareQuery(g_dbConnect, sql_cache);
 
 	if (!SQL_Execute(query))
 	{
 		server_print("query not saved");
-		SQL_QueryError(query, sql_error, 127);
-		server_print("[AMXX] %L", LANG_SERVER, "SQL_CANT_LOAD_ADMINS", sql_error);
+		SQL_QueryError(query, g_dbError, charsmax(g_dbError));
+		server_print("[AMXX] %L", LANG_SERVER, "SQL_CANT_LOAD_ADMINS", g_dbError);
 	}
 	else if (SQL_NumResults(query) >= 1)
 	{
@@ -1154,10 +1116,10 @@ stock UnGagPlayer(admin, victim, type, banMessage[], bool:IsSilence)
 			SQL_NextRow(query);
 		}
 
-		format(sql_cache, sizeof(sql_cache), "UPDATE %s_comms SET RemovedBy = (SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^^STEAM_[0-9]:%s$'), RemoveType = 'U', RemovedOn = UNIX_TIMESTAMP(), ureason = '%s' WHERE bid = %d", 
-			DatabasePrefix, DatabasePrefix, adminAuth, adminAuth[8], banMessage, sql_bid);
+		format(sql_cache, charsmax(sql_cache), "UPDATE %s_comms SET RemovedBy = (SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^^STEAM_[0-9]:%s$'), RemoveType = 'U', RemovedOn = UNIX_TIMESTAMP(), ureason = '%s' WHERE bid = %d", 
+			g_dbConfig[DB_PREFIX], g_dbConfig[DB_PREFIX], adminAuth, adminAuth[8], banMessage, sql_bid);
 
-		SQL_ThreadQuery(sql_db, "QueryHandle", sql_cache);
+		SQL_ThreadQuery(g_dbTaple, "QueryHandle", sql_cache);
 	}
 	else
 	{
@@ -1186,7 +1148,7 @@ stock UnGagPlayer(admin, victim, type, banMessage[], bool:IsSilence)
 			gag_chat[victim] = false;
 		}
 
-		log_amx("GoldSourceBans CMD: ^"%s<%d><%s><>^" has %s ^"%s<%d><%s><>^" - reason: ^"%s^"", name, get_user_userid(admin), authid, TypeName, name2, get_user_userid(victim), authid2, banMessage);
+		log_amx("GoldSrcBans CMD: ^"%s<%d><%s><>^" has %s ^"%s<%d><%s><>^" - reason: ^"%s^"", name, get_user_userid(admin), authid, TypeName, name2, get_user_userid(victim), authid2, banMessage);
 
 		new formated_text[501];
 		format(formated_text, 500, "[SourceBans] ^"%s<%s>^" has %s ^"%s<%s>^" - reason: ^"%s^"", name, authid, TypeName, name2, authid2, banMessage);
@@ -1223,30 +1185,28 @@ stock bool:IsValidClient(client)
 
 public SQL_Init()
 {
-	static szHost[64], szUser[32], szPass[32], szDB[32];
-	static get_type[12], set_type[12];
+	new error[MAX_ERR_LENGTH + 1];
+	new ercode;
 
-	get_pcvar_string( mysqlx_host, szHost, 63 );
-	get_pcvar_string( mysqlx_user, szUser, 31 );
-	get_pcvar_string( mysqlx_type, set_type, 11);
-	get_pcvar_string( mysqlx_pass, szPass, 31 );
-	get_pcvar_string( mysqlx_db, szDB, 127 );
+//	SQL_GetAffinity(get_type, 12);
 
-	SQL_GetAffinity(get_type, 12);
+	g_dbTaple 	= SQL_MakeDbTuple(
+		g_dbConfig[DB_HOST],
+		g_dbConfig[DB_USER],
+		g_dbConfig[DB_PASS],
+		g_dbConfig[DB_NAME]
+	);
+	g_dbConnect = SQL_Connect(g_dbTaple, ercode, error, charsmax(error));
 
-	sql_db = SQL_MakeDbTuple( szHost, szUser, szPass, szDB );
-
-	sql_api = SQL_Connect(sql_db, sql_errno, sql_error, 127);
-
-	if (sql_api == Empty_Handle)
-		server_print("[AMXX] %L", LANG_SERVER, "SQL_CANT_CON", sql_error);
+	if (g_dbConnect == Empty_Handle)
+		server_print("[AMXX] %L", LANG_SERVER, "SQL_CANT_CON", error);
 
 	// check if the table exist
-	formatex( sql_cache, 1023, "show tables like '%s_bans'", DatabasePrefix );
-	SQL_ThreadQuery( sql_db, "ShowBansTable", sql_cache );	
+	formatex( sql_cache, charsmax(sql_cache), "show tables like '%s_bans'", g_dbConfig[DB_PREFIX] );
+	SQL_ThreadQuery( g_dbTaple, "ShowBansTable", sql_cache );	
 
-	formatex( sql_cache, 1023, "show tables like '%s_comms'", DatabasePrefix );
-	SQL_ThreadQuery( sql_db, "ShowGagsTable", sql_cache );	
+	formatex( sql_cache, charsmax(sql_cache), "show tables like '%s_comms'", g_dbConfig[DB_PREFIX] );
+	SQL_ThreadQuery( g_dbTaple, "ShowGagsTable", sql_cache );	
 }
 
 //------------------
@@ -1279,12 +1239,12 @@ public ShowBansTable(FailState,Handle:Query,Error[],Errcode,Data[],DataSize)
 
 	if (SQL_NumResults(Query) > 0)
 	{
-		log_amx( "[SourceBans] Database table found: %s_bans", DatabasePrefix );
+		log_amx( "[SourceBans] Database table found: %s_bans", g_dbConfig[DB_PREFIX] );
 		HasLoadedBans = true;
 	}
 	else
 	{
-		log_amx( "[SourceBans] Could not find the table: %s_bans", DatabasePrefix );
+		log_amx( "[SourceBans] Could not find the table: %s_bans", g_dbConfig[DB_PREFIX] );
 		log_amx( "[SourceBans] Bans won't be loaded" );
 		HasLoadedBans = false;
 	}
@@ -1320,12 +1280,12 @@ public ShowGagsTable(FailState,Handle:Query,Error[],Errcode,Data[],DataSize)
 
 	if (SQL_NumResults(Query) > 0)
 	{
-		log_amx( "[SourceBans] Database table found: %s_comms", DatabasePrefix );
+		log_amx( "[SourceBans] Database table found: %s_comms", g_dbConfig[DB_PREFIX] );
 		HasLoadedGags = true;
 	}
 	else
 	{
-		log_amx( "[SourceBans] Could not find the table: %s_comms", DatabasePrefix );
+		log_amx( "[SourceBans] Could not find the table: %s_comms", g_dbConfig[DB_PREFIX] );
 		log_amx( "[SourceBans] Gags won't be loaded" );
 		HasLoadedGags = false;
 	}
@@ -1444,20 +1404,20 @@ public CheckBannedPlayer(FailState, Handle:Query, Error[], Errcode, Data[], Data
 
 		if (serverID == -1)
 		{
-			formatex(sql_cache, sizeof(sql_cache), "INSERT INTO %s_banlog (sid ,time ,name ,bid) VALUES  \
+			formatex(sql_cache, charsmax(sql_cache), "INSERT INTO %s_banlog (sid ,time ,name ,bid) VALUES  \
 				((SELECT sid FROM %s_servers WHERE ip = '%s' AND port = '%s' LIMIT 0,1), UNIX_TIMESTAMP(), '%s', \
 				(SELECT bid FROM %s_bans WHERE ((type = 0 AND authid REGEXP '^^STEAM_[0-9]:%s$') OR (type = 1 AND ip = '%s')) AND RemoveType IS NULL LIMIT 0,1))",
-				DatabasePrefix, DatabasePrefix, ServerIP, ServerPort, Name, DatabasePrefix, clientAuth[8], clientIp);
+				g_dbConfig[DB_PREFIX], g_dbConfig[DB_PREFIX], ServerIP, ServerPort, Name, g_dbConfig[DB_PREFIX], clientAuth[8], clientIp);
 		}
 		else
 		{
-			formatex(sql_cache, sizeof(sql_cache), "INSERT INTO %s_banlog (sid ,time ,name ,bid) VALUES  \
+			formatex(sql_cache, charsmax(sql_cache), "INSERT INTO %s_banlog (sid ,time ,name ,bid) VALUES  \
 				(%d, UNIX_TIMESTAMP(), '%s', \
 				(SELECT bid FROM %s_bans WHERE ((type = 0 AND authid REGEXP '^^STEAM_[0-9]:%s$') OR (type = 1 AND ip = '%s')) AND RemoveType IS NULL LIMIT 0,1))",
-				DatabasePrefix, serverID, Name, DatabasePrefix, clientAuth[8], clientIp);
+				g_dbConfig[DB_PREFIX], serverID, Name, g_dbConfig[DB_PREFIX], clientAuth[8], clientIp);
 		}
 
-		SQL_ThreadQuery(sql_db, "QueryHandle", sql_cache);
+		SQL_ThreadQuery(g_dbTaple, "QueryHandle", sql_cache);
 		//server_cmd("banid 5 #%d", get_user_userid(id));
 		server_cmd("kick #%d ^"You have been banned by this server, check %s for more info^"", get_user_userid(id), WebsiteAddress);
 	}
