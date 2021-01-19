@@ -6,3 +6,4 @@ This plugin is currently in its 'Alpha' stage, so it may not have up to sniff so
 
 # Credits
 Programmed and Created by Johan "JonnyBoy0719" Ehrendahl
+Modified by Aoi.Kagase.

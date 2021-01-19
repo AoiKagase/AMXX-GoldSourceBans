@@ -798,7 +798,7 @@ public CheckSourceBansFile()
 		configsDir[64];
 
 	get_configsdir(GetconfigsDir, 63);
-	format(configsDir, 63, "%s/goldsourcebans/settings.cfg", GetconfigsDir);
+	format(configsDir, 63, "%s/goldsrcbans/settings.cfg", GetconfigsDir);
 
 	if (!file_exists(configsDir))
 	{
